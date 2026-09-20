@@ -64,6 +64,14 @@
       ]
     },
     {
+      "backend": "local/v0.2.0",
+      "cases": [
+        {
+          "model": "/models/Qwen/Qwen3-30B-A3B/"
+        }
+      ]
+    },
+    {
       "backend": "local/v0.1.9",
       "cases": [
         {
