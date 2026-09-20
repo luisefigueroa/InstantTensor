@@ -6,6 +6,7 @@ from unittest import mock
 
 import torch
 
+import instanttensor._cpu_count as cpu_count_impl
 import instanttensor._impl as impl
 
 
@@ -17,6 +18,42 @@ IO_ENV_VARS = [
     "INSTANTTENSOR_MAX_FREE_MEM_USAGE",
     "INSTANTTENSOR_BUFFER_SIZE",
 ]
+
+
+class CPUCountTest(unittest.TestCase):
+    def test_cpu_count_uses_smallest_constraint(self):
+        with mock.patch.object(cpu_count_impl.os, "cpu_count", return_value=64), \
+             mock.patch.object(
+                 cpu_count_impl.os, "sched_getaffinity", return_value=set(range(8))
+             ), \
+             mock.patch.object(cpu_count_impl, "_cgroup_cpu_limit", return_value=3):
+            self.assertEqual(cpu_count_impl.cpu_count(), 3)
+
+    def test_cpu_count_is_at_least_one(self):
+        with mock.patch.object(cpu_count_impl.os, "cpu_count", return_value=None), \
+             mock.patch.object(cpu_count_impl.os, "sched_getaffinity", return_value=set()), \
+             mock.patch.object(cpu_count_impl, "_cgroup_cpu_limit", return_value=None):
+            self.assertEqual(cpu_count_impl.cpu_count(), 1)
+
+    def test_cpu_count_cgroup_v2(self):
+        cpu_max = mock.mock_open(read_data="150000 100000")
+        with mock.patch.object(cpu_count_impl.os.path, "exists", return_value=True), \
+             mock.patch("builtins.open", cpu_max):
+            self.assertEqual(cpu_count_impl._cgroup_cpu_limit(), 2)
+
+    def test_cpu_count_cgroup_v1(self):
+        quota_file = mock.mock_open(read_data="150000").return_value
+        period_file = mock.mock_open(read_data="100000").return_value
+        exists = lambda path: path != cpu_count_impl._CGROUP_V2_CPU_MAX
+        with mock.patch.object(cpu_count_impl.os.path, "exists", side_effect=exists), \
+             mock.patch("builtins.open", side_effect=[quota_file, period_file]):
+            self.assertEqual(cpu_count_impl._cgroup_cpu_limit(), 2)
+
+    def test_cpu_count_cgroup_unlimited(self):
+        cpu_max = mock.mock_open(read_data="max 100000")
+        with mock.patch.object(cpu_count_impl.os.path, "exists", return_value=True), \
+             mock.patch("builtins.open", cpu_max):
+            self.assertIsNone(cpu_count_impl._cgroup_cpu_limit())
 
 
 class IOParamsTest(unittest.TestCase):
@@ -50,7 +87,7 @@ class IOParamsTest(unittest.TestCase):
         with ExitStack() as stack:
             stack.enter_context(mock.patch.object(impl, "file_in_memory", return_value=in_memory))
             stack.enter_context(mock.patch.object(impl, "select_backend", return_value=selected_backend))
-            stack.enter_context(mock.patch.object(impl.os, "cpu_count", return_value=64))
+            stack.enter_context(mock.patch.object(impl, "cpu_count", return_value=64))
             stack.enter_context(mock.patch.object(
                 impl.torch.cuda,
                 "mem_get_info",

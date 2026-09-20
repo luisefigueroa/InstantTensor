@@ -6,6 +6,7 @@ import warnings
 import torch # must before instanttensor._C
 import torch.distributed as dist
 import instanttensor._C as _C
+from instanttensor._cpu_count import cpu_count
 from enum import Enum
 from typing import Union, Generator, Optional
 import threading
@@ -658,7 +659,7 @@ class safe_open:
                 )
                 concurrency = 0
 
-        default_concurrency = max(min(32, os.cpu_count() or 1) // self.world_size, 1)
+        default_concurrency = max(min(32, cpu_count()) // self.world_size, 1)
         if backend == Backend.MMAP:
             if chunk_size is None:
                 chunk_size = 2 * 1024 * 1024
