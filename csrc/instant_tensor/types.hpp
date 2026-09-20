@@ -30,6 +30,7 @@ using IOExecutorBase = SingleWorkerDriverExecutor<IOOperation, std::any,
                                                 MAX_IO_DEPTH, MAX_IO_DEPTH>;
 
 class IOExecutor;
+class CUDAExecutor;
 
 // NOTE: edit 
 enum Backend {
@@ -142,7 +143,7 @@ struct IORequest {
 };
 
 struct ChunkRequest {
-    SingleThreadTaskExecutor* executor;
+    CUDAExecutor* executor;
     int wait_handle;
 };
 

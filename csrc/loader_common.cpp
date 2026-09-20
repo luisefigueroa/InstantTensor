@@ -164,17 +164,14 @@ void Loader::init_threads() {
             this->last_page_reader_thread = std::make_unique<SingleThreadTaskExecutor>(driver_factory);
         }
     }
-    if(!this->cuda_thread) {
-        this->cuda_thread = std::make_unique<SingleThreadTaskExecutor>(driver_factory);
+    if(!this->cuda_executor) {
+        this->cuda_executor = std::make_unique<CUDAExecutor>(this->device_idx);
     }
     if(!this->cuda_stream) {
         CUDA_CHECK(cudaStreamCreateWithFlags(&this->cuda_stream, cudaStreamNonBlocking));
     }
     if(!this->nccl_stream) {
         CUDA_CHECK(cudaStreamCreateWithFlags(&this->nccl_stream, cudaStreamNonBlocking));
-    }
-    if(!this->wait_thread) {
-        this->wait_thread = std::make_unique<SingleThreadTaskExecutor>(driver_factory);
     }
 
     this->cuda_events.resize(this->io_depth);
@@ -194,20 +191,17 @@ void Loader::init_threads() {
 }
 
 void Loader::destroy_threads() {
+    if (this->cuda_executor) {
+        this->cuda_executor->join();
+    }
+    if (this->io_thread) {
+        this->io_thread->join();
+    }
     if (this->worker_threads) {
         this->worker_threads->join();
     }
     if (this->last_page_reader_thread) {
         this->last_page_reader_thread->join();
-    }
-    if (this->io_thread) {
-        this->io_thread->join();
-    }
-    if (this->cuda_thread) {
-        this->cuda_thread->join();
-    }
-    if (this->wait_thread) {
-        this->wait_thread->join();
     }
     if (this->cuda_stream) {
         CUDA_CHECK(cudaStreamDestroy(this->cuda_stream));
@@ -518,11 +512,12 @@ void Loader::post_read_chunk() {
         io_request = this->post_read_chunk_aio(params);
     }
 
-    auto cuda_func = [=]() {
-        io_request.executor->reap(io_request.wait_handle);
-        if (!io_request.loaded_to_device) {
+    bool loaded_to_device = io_request.loaded_to_device;
+    auto launch = [this, loaded_to_device, rank_dst, window_offset, rank_size,
+                   event, padded_rank_size, all_dst]() {
+        if (!loaded_to_device) {
             CUDA_CHECK(cudaMemcpyAsync(
-                rank_dst, (char*)this->host_buffer + params.window_offset,
+                rank_dst, (char*)this->host_buffer + window_offset,
                 rank_size, cudaMemcpyHostToDevice, this->cuda_stream));
         }
         CUDA_CHECK(cudaEventRecord(event, this->cuda_stream));
@@ -534,17 +529,11 @@ void Loader::post_read_chunk() {
             CUDA_CHECK(cudaEventRecord(event, this->nccl_stream));
         }
     };
-    int cuda_req_id = this->next_loader_task_id();
-    this->cuda_thread->submit(cuda_req_id, std::move(cuda_func));
-
-    auto wait_func = [=]() mutable {
-        this->cuda_thread->reap(cuda_req_id);
-        CUDA_CHECK(cudaEventSynchronize(event));
-    };
     int completion_req_id = this->next_loader_task_id();
-    this->wait_thread->submit(completion_req_id, std::move(wait_func));
+    this->cuda_executor->submit(completion_req_id, CUDAOperation{
+        io_request, std::move(launch), event});
     this->chunks[chunk_id].request = ChunkRequest{
-        this->wait_thread.get(), completion_req_id};
+        this->cuda_executor.get(), completion_req_id};
 }
 
 void Loader::poll_read_chunk() {

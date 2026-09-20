@@ -3,6 +3,7 @@
 #include <instant_tensor/common.hpp>
 #include <instant_tensor/types.hpp>
 #include <instant_tensor/io_executor.hpp>
+#include <instant_tensor/cuda_executor.hpp>
 #include <instant_tensor/io_context.hpp>
 #include <liburing.h>
 
@@ -41,8 +42,7 @@ public:
     unique_ptr<ThreadPoolTaskExecutor> worker_threads;
     unique_ptr<SingleThreadTaskExecutor> last_page_reader_thread;
     unique_ptr<IOExecutor> io_thread;
-    unique_ptr<SingleThreadTaskExecutor> cuda_thread;
-    unique_ptr<SingleThreadTaskExecutor> wait_thread;
+    unique_ptr<CUDAExecutor> cuda_executor;
     std::thread io_depth_sample_thread;
     cudaStream_t cuda_stream = nullptr;
     cudaStream_t nccl_stream = nullptr;

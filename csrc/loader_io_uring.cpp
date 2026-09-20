@@ -4,8 +4,8 @@
 
 namespace instanttensor {
 
-// The loader thread prepares and submits SQEs. cuda_thread consumes CQEs before
-// launching H2D and NCCL work. Each side has a single caller for its ring API.
+// The loader thread prepares and submits SQEs. The CUDA completion worker consumes
+// CQEs before launching H2D and NCCL work. Each side has a single ring caller.
 
 #define IO_URING_REGISTER_BUFFER_SIZE (1<<30) // 1GiB buffer size limit
 

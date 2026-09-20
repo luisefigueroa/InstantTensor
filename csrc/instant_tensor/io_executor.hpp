@@ -88,17 +88,28 @@ private:
 
 class IOExecutor : public IOExecutorBase {
 public:
-    using IOExecutorBase::try_reap;
-
     IOExecutor()
       : IOExecutorBase([]() { return std::make_unique<IOWorkerDriver>(); })
     {
         IOExecutorBase::start();
     }
 
+    bool try_reap(int request_id, std::any& result) {
+        if (!IOExecutorBase::try_reap(request_id, result)) {
+            return false;
+        }
+        rethrow_if_error(result);
+        return true;
+    }
+
     void reap(int request_id) {
         std::any result;
         IOExecutorBase::reap(request_id, result);
+        rethrow_if_error(result);
+    }
+
+private:
+    static void rethrow_if_error(const std::any& result) {
         if (result.type() == typeid(std::exception_ptr)) {
             std::rethrow_exception(std::any_cast<std::exception_ptr>(result));
         }
