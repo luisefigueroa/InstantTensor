@@ -170,7 +170,7 @@ class IOParamsTest(unittest.TestCase):
                     selected_backend=impl.Backend.AIO, in_memory=False,
                     world_size=2, buffer_size=1342177280,
                     chunk_size=1 << 20, io_depth=4, free_bytes=1031131130,
-                    max_free_mem_usage=0.1, budget_source="host_available",
+                    max_free_mem_usage=0.1, budget_source="mem_available",
                     properties=SimpleNamespace(
                         name="NVIDIA GB10", major=12, minor=1,
                         is_integrated=integrated,
@@ -190,7 +190,7 @@ class IOParamsTest(unittest.TestCase):
             loader = self.determine_io_params(
                 selected_backend=impl.Backend.AIO, in_memory=False,
                 buffer_size=1342177280, chunk_size=1 << 20, io_depth=4,
-                max_free_mem_usage=0.1, budget_source="host_available",
+                max_free_mem_usage=0.1, budget_source="mem_available",
                 meminfo="MemTotal: 131072000 kB\nMemAvailable: 5242880 kB\n",
             )
             loader.tensor_sizes = [1249902592]
@@ -218,7 +218,7 @@ class IOParamsTest(unittest.TestCase):
                         selected_backend=impl.Backend.AIO, in_memory=False,
                         world_size=2, buffer_size=1342177280,
                         chunk_size=1 << 20, io_depth=4,
-                        budget_source="host_available", meminfo=sample,
+                        budget_source="mem_available", meminfo=sample,
                         peer_budget=2 << 30,
                     )
                 self.assertEqual(self.local_collective_budget, 0)
@@ -230,7 +230,7 @@ class IOParamsTest(unittest.TestCase):
                     selected_backend=impl.Backend.AIO, in_memory=False,
                     world_size=2, buffer_size=1342177280,
                     chunk_size=1 << 20, io_depth=4,
-                    budget_source="host_available", peer_budget=2 << 30,
+                    budget_source="mem_available", peer_budget=2 << 30,
                 )
         self.assertEqual(self.local_collective_budget, 0)
 
@@ -248,18 +248,18 @@ class IOParamsTest(unittest.TestCase):
                     self.determine_io_params(
                         selected_backend=impl.Backend.AIO, in_memory=False,
                         buffer_size=1342177280, chunk_size=1 << 20, io_depth=4,
-                        budget_source="host_available", properties=value,
+                        budget_source="mem_available", properties=value,
                     )
                 self.meminfo_read.assert_not_called()
 
     def test_host_budget_requires_linux_and_explicit_ring(self):
         for platform, buffer_size in (("win32", 1342177280), ("linux", None)):
             with self.subTest(platform=platform, buffer_size=buffer_size):
-                with self.assertRaisesRegex(RuntimeError, "host_available requires"):
+                with self.assertRaisesRegex(RuntimeError, "mem_available requires"):
                     self.determine_io_params(
                         selected_backend=impl.Backend.AIO, in_memory=False,
                         buffer_size=buffer_size, chunk_size=1 << 20, io_depth=4,
-                        budget_source="host_available", platform=platform,
+                        budget_source="mem_available", platform=platform,
                     )
                 self.meminfo_read.assert_not_called()
 
@@ -274,12 +274,12 @@ class IOParamsTest(unittest.TestCase):
                     )
 
     def test_unknown_budget_source_rejects_after_zero_peer_minimum(self):
-        with self.assertRaisesRegex(RuntimeError, "must be cuda_free or host_available"):
+        with self.assertRaisesRegex(RuntimeError, "must be cuda_free or mem_available"):
             self.determine_io_params(
                 selected_backend=impl.Backend.AIO, in_memory=False,
                 world_size=2, buffer_size=1342177280,
                 chunk_size=1 << 20, io_depth=4,
-                budget_source="system", peer_budget=2 << 30,
+                budget_source="host_available", peer_budget=2 << 30,
             )
         self.assertEqual(self.local_collective_budget, 0)
 
@@ -288,7 +288,7 @@ class IOParamsTest(unittest.TestCase):
         loader = self.determine_io_params(
             selected_backend=impl.Backend.AIO, in_memory=False,
             buffer_size=1342177280, chunk_size=1 << 20, io_depth=4,
-            max_free_mem_usage=None, budget_source="host_available",
+            max_free_mem_usage=None, budget_source="mem_available",
         )
         self.assertEqual(loader._device_memory_budget, (27 << 30) // 10)
 
@@ -299,7 +299,7 @@ class IOParamsTest(unittest.TestCase):
                     selected_backend=impl.Backend.AIO, in_memory=False,
                     world_size=2, buffer_size=1342177280,
                     chunk_size=1 << 20, io_depth=4,
-                    max_free_mem_usage=0.1, budget_source="host_available",
+                    max_free_mem_usage=0.1, budget_source="mem_available",
                     peer_budget=peer_budget,
                 )
                 if peer_budget == 0:
@@ -321,7 +321,7 @@ class IOParamsTest(unittest.TestCase):
         loader = self.determine_io_params(
             selected_backend=impl.Backend.AIO, in_memory=False,
             buffer_size=1 << 20, chunk_size=1 << 20, io_depth=1,
-            max_free_mem_usage=0.1, budget_source="host_available",
+            max_free_mem_usage=0.1, budget_source="mem_available",
         )
         loader.tensor_sizes = [1249902592]
         loader.total_tensor_size = 1249902592
@@ -337,7 +337,7 @@ class IOParamsTest(unittest.TestCase):
         loader = self.determine_io_params(
             selected_backend=impl.Backend.AIO, in_memory=False,
             buffer_size=1342177280, chunk_size=1 << 20, io_depth=4,
-            max_free_mem_usage=0.1, budget_source="host_available",
+            max_free_mem_usage=0.1, budget_source="mem_available",
         )
         loader.tensor_sizes = [1249902592]
         loader.total_tensor_size = 1249902592

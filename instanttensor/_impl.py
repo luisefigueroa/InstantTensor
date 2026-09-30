@@ -206,16 +206,16 @@ def env_buffer_size():
 
 def _memory_budget_source():
     source = os.environ.get("INSTANTTENSOR_MEMORY_BUDGET_SOURCE", "cuda_free")
-    if source not in ("cuda_free", "host_available"):
-        raise ValueError("INSTANTTENSOR_MEMORY_BUDGET_SOURCE must be cuda_free or host_available")
+    if source not in ("cuda_free", "mem_available"):
+        raise ValueError("INSTANTTENSOR_MEMORY_BUDGET_SOURCE must be cuda_free or mem_available")
     return source
 
 
 def _gb10_host_available_bytes(device, buffer_size):
     if buffer_size is None:
-        raise ValueError("host_available requires an explicit buffer_size")
+        raise ValueError("mem_available requires an explicit buffer_size")
     if sys.platform != "linux":
-        raise ValueError("host_available requires Linux NVIDIA GB10")
+        raise ValueError("mem_available requires Linux NVIDIA GB10")
     properties = torch.cuda.get_device_properties(device)
     integrated = properties.is_integrated
     if (
@@ -224,7 +224,7 @@ def _gb10_host_available_bytes(device, buffer_size):
         or not isinstance(integrated, (bool, int))
         or integrated != 1
     ):
-        raise ValueError("host_available requires integrated NVIDIA GB10 (sm_121)")
+        raise ValueError("mem_available requires integrated NVIDIA GB10 (sm_121)")
 
     fields = {}
     with open("/proc/meminfo", encoding="ascii") as meminfo:
@@ -790,7 +790,7 @@ class safe_open:
         budget_error = None
         try:
             budget_source = _memory_budget_source()
-            if budget_source == "host_available":
+            if budget_source == "mem_available":
                 host_available = _gb10_host_available_bytes(self.device, buffer_size)
             available_memory = free_bytes if host_available is None else host_available
             avail_bytes = int(available_memory * max_free_mem_usage)
