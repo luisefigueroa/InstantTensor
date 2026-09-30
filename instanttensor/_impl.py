@@ -3,6 +3,7 @@ import sys
 import time
 import json
 import warnings
+import math
 import torch # must before instanttensor._C
 import torch.distributed as dist
 import instanttensor._C as _C
@@ -201,6 +202,49 @@ def env_max_free_mem_usage():
 def env_buffer_size():
     ret = os.environ.get("INSTANTTENSOR_BUFFER_SIZE")
     return int(ret) if ret is not None else None
+
+
+def _memory_budget_source():
+    source = os.environ.get("INSTANTTENSOR_MEMORY_BUDGET_SOURCE", "cuda_free")
+    if source not in ("cuda_free", "host_available"):
+        raise ValueError("INSTANTTENSOR_MEMORY_BUDGET_SOURCE must be cuda_free or host_available")
+    return source
+
+
+def _gb10_host_available_bytes(device, buffer_size):
+    if buffer_size is None:
+        raise ValueError("host_available requires an explicit buffer_size")
+    if sys.platform != "linux":
+        raise ValueError("host_available requires Linux NVIDIA GB10")
+    properties = torch.cuda.get_device_properties(device)
+    integrated = properties.is_integrated
+    if (
+        properties.name != "NVIDIA GB10"
+        or (properties.major, properties.minor) != (12, 1)
+        or not isinstance(integrated, (bool, int))
+        or integrated != 1
+    ):
+        raise ValueError("host_available requires integrated NVIDIA GB10 (sm_121)")
+
+    fields = {}
+    with open("/proc/meminfo", encoding="ascii") as meminfo:
+        for line in meminfo:
+            name, separator, value = line.partition(":")
+            if name not in ("MemTotal", "MemAvailable"):
+                continue
+            words = value.split()
+            if name in fields or not separator or len(words) != 2 or words[1] != "kB" or not words[0].isdigit():
+                raise ValueError("Invalid or duplicate " + name + " in /proc/meminfo")
+            fields[name] = int(words[0])
+    if "MemTotal" not in fields or "MemAvailable" not in fields:
+        raise ValueError("Missing MemTotal or MemAvailable in /proc/meminfo")
+    if (
+        fields["MemTotal"] <= 0
+        or fields["MemTotal"] > ((1 << 63) - 1) // 1024
+        or fields["MemAvailable"] > fields["MemTotal"]
+    ):
+        raise ValueError("Invalid MemTotal/MemAvailable bounds in /proc/meminfo")
+    return fields["MemAvailable"] * 1024
 
 
 def _resolve_open_config(
@@ -737,9 +781,27 @@ class safe_open:
         
         if max_free_mem_usage is None:
             max_free_mem_usage = 0.5
+        if not math.isfinite(max_free_mem_usage) or not 0 < max_free_mem_usage <= 1:
+            raise ValueError("max_free_mem_usage must be finite and satisfy 0 < value <= 1")
         
         free_bytes, total_bytes = torch.cuda.mem_get_info()
-        avail_bytes = int(free_bytes * max_free_mem_usage)
+        budget_source = "cuda_free"
+        host_available = None
+        budget_error = None
+        try:
+            budget_source = _memory_budget_source()
+            if budget_source == "host_available":
+                host_available = _gb10_host_available_bytes(self.device, buffer_size)
+            available_memory = free_bytes if host_available is None else host_available
+            avail_bytes = int(available_memory * max_free_mem_usage)
+            if not 0 <= avail_bytes < (1 << 63):
+                raise ValueError("Memory budget is outside the collective integer range")
+        except (OSError, ValueError, AttributeError) as error:
+            # Participate in the existing MIN collective before rejecting, so
+            # invalid metadata on one rank cannot strand another rank there.
+            budget_error = error
+            avail_bytes = 0
+        local_budget = avail_bytes
 
         self.sync_time = time.perf_counter()
         if self.process_group is not None:
@@ -752,6 +814,12 @@ class safe_open:
             # print("ncclComm_t:", self.process_group._get_backend(self.device)._comm_ptr())
 
         self._device_memory_budget = avail_bytes
+        debug_log(
+            "Memory budget source=%s CUDA-free=%d host-available=%s fraction=%s local=%d reduced=%d",
+            budget_source, free_bytes, host_available, max_free_mem_usage, local_budget, avail_bytes,
+        )
+        if budget_error is not None:
+            raise RuntimeError("Cannot select memory budget: " + str(budget_error)) from budget_error
         buffer_size_per_io_depth = required_buffer_size_for_io(
             chunk_size, 1, self.world_size,
         )
