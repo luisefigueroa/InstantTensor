@@ -1,11 +1,20 @@
+import io
+import json
 import os
+from pathlib import Path
+import struct
+import subprocess
+import sys
+import tempfile
 import unittest
 import warnings
-from types import SimpleNamespace
 from contextlib import ExitStack
+from datetime import timedelta
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
+from instanttensor import Backend, safe_open
 
 import instanttensor._cpu_count as cpu_count_impl
 import instanttensor._impl as impl
@@ -18,7 +27,6 @@ IO_ENV_VARS = [
     "INSTANTTENSOR_IO_DEPTH",
     "INSTANTTENSOR_MAX_FREE_MEM_USAGE",
     "INSTANTTENSOR_BUFFER_SIZE",
-    "INSTANTTENSOR_MEMORY_BUDGET_SOURCE",
 ]
 
 
@@ -79,57 +87,20 @@ class IOParamsTest(unittest.TestCase):
         io_depth=None,
         buffer_size=None,
         free_bytes=1 << 50,
-        max_free_mem_usage=1.0,
-        budget_source=None,
-        properties=None,
-        meminfo=None,
-        platform="linux",
-        peer_budget=None,
     ):
         loader = impl.safe_open.__new__(impl.safe_open)
         loader.filename = ["model.safetensors"]
         loader.world_size = world_size
         loader.process_group = None
         loader.device = torch.device("cuda:0")
-        loader.device_idx = 0
-        loader.loader_handle = None
-        if peer_budget is not None:
-            loader.process_group = object()
-
-        if properties is None:
-            properties = SimpleNamespace(
-                name="NVIDIA GB10", major=12, minor=1, is_integrated=True,
-            )
-        if meminfo is None:
-            meminfo = "MemTotal: 131072000 kB\nMemAvailable: 28311552 kB\nSwapFree: 999999999 kB\n"
-        if budget_source is not None:
-            os.environ["INSTANTTENSOR_MEMORY_BUDGET_SOURCE"] = budget_source
 
         with ExitStack() as stack:
             stack.enter_context(mock.patch.object(impl, "file_in_memory", return_value=in_memory))
             stack.enter_context(mock.patch.object(impl, "select_backend", return_value=selected_backend))
             stack.enter_context(mock.patch.object(impl, "cpu_count", return_value=64))
-            stack.enter_context(mock.patch.object(impl.sys, "platform", platform))
-            self.properties_query = stack.enter_context(mock.patch.object(
-                impl.torch.cuda, "get_device_properties", return_value=properties,
+            stack.enter_context(mock.patch.object(
+                impl.torch.cuda, "get_device_properties", return_value=mock.Mock(is_integrated=False),
             ))
-            self.meminfo_read = stack.enter_context(mock.patch(
-                "builtins.open", mock.mock_open(read_data=meminfo),
-            ))
-            if peer_budget is not None:
-                original_tensor = torch.tensor
-                stack.enter_context(mock.patch.object(
-                    impl.torch, "tensor",
-                    side_effect=lambda values, **kwargs: original_tensor(values),
-                ))
-                def reduce_min(tensor, *, op, group):
-                    self.assertEqual(op, torch.distributed.ReduceOp.MIN)
-                    self.assertIs(group, loader.process_group)
-                    self.local_collective_budget = tensor.item()
-                    tensor.fill_(min(tensor.item(), peer_budget))
-                stack.enter_context(mock.patch.object(
-                    impl.dist, "all_reduce", side_effect=reduce_min,
-                ))
             stack.enter_context(mock.patch.object(
                 impl.torch.cuda,
                 "mem_get_info",
@@ -140,214 +111,11 @@ class IOParamsTest(unittest.TestCase):
                 chunk_size=chunk_size,
                 concurrency=concurrency,
                 io_depth=io_depth,
-                max_free_mem_usage=max_free_mem_usage,
+                max_free_mem_usage=1.0,
                 backend=selected_backend,
             )
             loader._determine_io_params(config)
         return loader
-
-    def test_default_budget_never_reads_host_metadata(self):
-        for buffer_size in (None, 1342177280):
-            with self.subTest(buffer_size=buffer_size):
-                loader = self.determine_io_params(
-                    selected_backend=impl.Backend.AIO, in_memory=False,
-                    buffer_size=buffer_size, chunk_size=1 << 20, io_depth=4,
-                    free_bytes=1031131130, max_free_mem_usage=0.1,
-                )
-                self.assertEqual(loader._device_memory_budget, 103113113)
-                self.properties_query.assert_not_called()
-                self.meminfo_read.assert_not_called()
-                if buffer_size is not None:
-                    loader.tensor_sizes = [1249902592]
-                    loader.total_tensor_size = 1249902592
-                    with self.assertRaisesRegex(RuntimeError, "exceeds device memory budget"):
-                        loader._finalize_buffer_size(buffer_size)
-
-    def test_gb10_explicit_ring_uses_host_fraction_without_swap_credit(self):
-        for integrated in (True, 1):
-            with self.subTest(integrated=integrated):
-                loader = self.determine_io_params(
-                    selected_backend=impl.Backend.AIO, in_memory=False,
-                    world_size=2, buffer_size=1342177280,
-                    chunk_size=1 << 20, io_depth=4, free_bytes=1031131130,
-                    max_free_mem_usage=0.1, budget_source="mem_available",
-                    properties=SimpleNamespace(
-                        name="NVIDIA GB10", major=12, minor=1,
-                        is_integrated=integrated,
-                    ),
-                )
-                # The fixture has exactly 27 GiB available. Integer division
-                # supplies an independent expected budget for fraction 1/10.
-                self.assertEqual(loader._device_memory_budget, (27 << 30) // 10)
-                loader.tensor_sizes = [1249902592, 128 << 20]
-                loader.total_tensor_size = sum(loader.tensor_sizes)
-                loader._finalize_buffer_size(1342177280)
-                self.assertEqual(loader.buffer_size, 1342177280)
-                self.assertEqual(loader.io_depth, 4)
-
-    def test_host_budget_rejects_insufficient_ring_headroom_before_open(self):
-        with mock.patch.object(impl._C, "open") as native_open:
-            loader = self.determine_io_params(
-                selected_backend=impl.Backend.AIO, in_memory=False,
-                buffer_size=1342177280, chunk_size=1 << 20, io_depth=4,
-                max_free_mem_usage=0.1, budget_source="mem_available",
-                meminfo="MemTotal: 131072000 kB\nMemAvailable: 5242880 kB\n",
-            )
-            loader.tensor_sizes = [1249902592]
-            loader.total_tensor_size = 1249902592
-            with self.assertRaisesRegex(RuntimeError, "exceeds device memory budget"):
-                loader._finalize_buffer_size(1342177280)
-            native_open.assert_not_called()
-
-    def test_bad_host_metadata_contributes_zero_to_peer_minimum(self):
-        samples = [
-            "MemTotal: 10000 kB\n",
-            "MemAvailable: 1000 kB\n",
-            "MemTotal: 0 kB\nMemAvailable: 0 kB\n",
-            "MemTotal: 10000 kB\nMemAvailable: -1 kB\n",
-            "MemTotal: 10000 kB\nMemAvailable: 10001 kB\n",
-            "MemTotal: 10000 kB\nMemAvailable: 1000 MB\n",
-            "MemTotal: 10000 kB\nMemAvailable: x kB\n",
-            "MemTotal: 10000 kB\nMemAvailable: 1000 kB\nMemAvailable: 1000 kB\n",
-            "MemTotal: 999999999999999999999 kB\nMemAvailable: 1 kB\n",
-        ]
-        for sample in samples:
-            with self.subTest(sample=sample):
-                with self.assertRaisesRegex(RuntimeError, "Cannot select memory budget"):
-                    self.determine_io_params(
-                        selected_backend=impl.Backend.AIO, in_memory=False,
-                        world_size=2, buffer_size=1342177280,
-                        chunk_size=1 << 20, io_depth=4,
-                        budget_source="mem_available", meminfo=sample,
-                        peer_budget=2 << 30,
-                    )
-                self.assertEqual(self.local_collective_budget, 0)
-
-    def test_unreadable_host_metadata_contributes_zero(self):
-        with mock.patch.object(impl, "_gb10_host_available_bytes", side_effect=OSError("unreadable meminfo")):
-            with self.assertRaisesRegex(RuntimeError, "unreadable meminfo"):
-                self.determine_io_params(
-                    selected_backend=impl.Backend.AIO, in_memory=False,
-                    world_size=2, buffer_size=1342177280,
-                    chunk_size=1 << 20, io_depth=4,
-                    budget_source="mem_available", peer_budget=2 << 30,
-                )
-        self.assertEqual(self.local_collective_budget, 0)
-
-    def test_host_budget_requires_exact_hardware_metadata(self):
-        properties = [
-            SimpleNamespace(name="NVIDIA GB10", major=12, minor=0, is_integrated=True),
-            SimpleNamespace(name="NVIDIA RTX PRO 6000", major=12, minor=1, is_integrated=True),
-            SimpleNamespace(name="NVIDIA GB10", major=12, minor=1, is_integrated=False),
-            SimpleNamespace(name="NVIDIA GB10", major=12, minor=1, is_integrated="1"),
-            SimpleNamespace(name="NVIDIA GB10", major=12, minor=1),
-        ]
-        for value in properties:
-            with self.subTest(properties=value):
-                with self.assertRaisesRegex(RuntimeError, "Cannot select memory budget"):
-                    self.determine_io_params(
-                        selected_backend=impl.Backend.AIO, in_memory=False,
-                        buffer_size=1342177280, chunk_size=1 << 20, io_depth=4,
-                        budget_source="mem_available", properties=value,
-                    )
-                self.meminfo_read.assert_not_called()
-
-    def test_host_budget_requires_linux_and_explicit_ring(self):
-        for platform, buffer_size in (("win32", 1342177280), ("linux", None)):
-            with self.subTest(platform=platform, buffer_size=buffer_size):
-                with self.assertRaisesRegex(RuntimeError, "mem_available requires"):
-                    self.determine_io_params(
-                        selected_backend=impl.Backend.AIO, in_memory=False,
-                        buffer_size=buffer_size, chunk_size=1 << 20, io_depth=4,
-                        budget_source="mem_available", platform=platform,
-                    )
-                self.meminfo_read.assert_not_called()
-
-    def test_memory_fraction_rejects_invalid_values(self):
-        for value in (0, -0.1, 1.01, float("nan"), float("inf"), -float("inf")):
-            with self.subTest(fraction=value):
-                with self.assertRaisesRegex(ValueError, "finite.*0 < value <= 1"):
-                    self.determine_io_params(
-                        selected_backend=impl.Backend.AIO, in_memory=False,
-                        buffer_size=1342177280, chunk_size=1 << 20, io_depth=4,
-                        max_free_mem_usage=value,
-                    )
-
-    def test_unknown_budget_source_rejects_after_zero_peer_minimum(self):
-        with self.assertRaisesRegex(RuntimeError, "must be cuda_free or mem_available"):
-            self.determine_io_params(
-                selected_backend=impl.Backend.AIO, in_memory=False,
-                world_size=2, buffer_size=1342177280,
-                chunk_size=1 << 20, io_depth=4,
-                budget_source="host_available", peer_budget=2 << 30,
-            )
-        self.assertEqual(self.local_collective_budget, 0)
-
-    def test_host_fraction_environment_retains_its_meaning(self):
-        os.environ["INSTANTTENSOR_MAX_FREE_MEM_USAGE"] = "0.1"
-        loader = self.determine_io_params(
-            selected_backend=impl.Backend.AIO, in_memory=False,
-            buffer_size=1342177280, chunk_size=1 << 20, io_depth=4,
-            max_free_mem_usage=None, budget_source="mem_available",
-        )
-        self.assertEqual(loader._device_memory_budget, (27 << 30) // 10)
-
-    def test_host_budget_uses_smaller_peer_and_rejects_invalid_peer(self):
-        for peer_budget in (2 << 30, 64 << 20, 0):
-            with self.subTest(peer_budget=peer_budget):
-                options = dict(
-                    selected_backend=impl.Backend.AIO, in_memory=False,
-                    world_size=2, buffer_size=1342177280,
-                    chunk_size=1 << 20, io_depth=4,
-                    max_free_mem_usage=0.1, budget_source="mem_available",
-                    peer_budget=peer_budget,
-                )
-                if peer_budget == 0:
-                    with self.assertRaisesRegex(RuntimeError, "too small for one I/O operation"):
-                        self.determine_io_params(**options)
-                    self.assertEqual(self.local_collective_budget, (27 << 30) // 10)
-                    continue
-                loader = self.determine_io_params(**options)
-                self.assertEqual(loader._device_memory_budget, peer_budget)
-                loader.tensor_sizes = [1249902592]
-                loader.total_tensor_size = 1249902592
-                if peer_budget < 1342177280:
-                    with self.assertRaisesRegex(RuntimeError, "exceeds device memory budget"):
-                        loader._finalize_buffer_size(1342177280)
-                else:
-                    loader._finalize_buffer_size(1342177280)
-
-    def test_largest_tensor_enlargement_still_obeys_host_budget(self):
-        loader = self.determine_io_params(
-            selected_backend=impl.Backend.AIO, in_memory=False,
-            buffer_size=1 << 20, chunk_size=1 << 20, io_depth=1,
-            max_free_mem_usage=0.1, budget_source="mem_available",
-        )
-        loader.tensor_sizes = [1249902592]
-        loader.total_tensor_size = 1249902592
-        with self.assertWarnsRegex(RuntimeWarning, "match the largest tensor"):
-            loader._finalize_buffer_size(1 << 20)
-        self.assertEqual(loader.buffer_size, 1249902592)
-        loader._device_memory_budget = 1 << 30
-        with self.assertWarnsRegex(RuntimeWarning, "match the largest tensor"):
-            with self.assertRaisesRegex(RuntimeError, "exceeds device memory budget"):
-                loader._finalize_buffer_size(1 << 20)
-
-    def test_native_allocator_failure_propagates_after_host_admission(self):
-        loader = self.determine_io_params(
-            selected_backend=impl.Backend.AIO, in_memory=False,
-            buffer_size=1342177280, chunk_size=1 << 20, io_depth=4,
-            max_free_mem_usage=0.1, budget_source="mem_available",
-        )
-        loader.tensor_sizes = [1249902592]
-        loader.total_tensor_size = 1249902592
-        loader.tensor_offsets = []
-        loader._finalize_buffer_size(1342177280)
-        with mock.patch.object(impl._C, "open", side_effect=RuntimeError("native allocation failed")) as native_open:
-            with self.assertRaisesRegex(RuntimeError, "native allocation failed"):
-                loader._open()
-            native_open.assert_called_once()
-        self.assertIsNone(loader.loader_handle)
 
     def test_native_configuration_is_the_single_source_of_truth(self):
         self.assertEqual(
@@ -757,5 +525,139 @@ class IOParamsTest(unittest.TestCase):
         warn.assert_not_called()
 
 
+def write_weights(path, size):
+    header = json.dumps({"weight": {"dtype": "U8", "shape": [size], "data_offsets": [0, size]}}).encode()
+    with open(path, "wb") as file:
+        file.write(struct.pack("<Q", len(header)) + header)
+        file.truncate(file.tell() + size)  # Sparse payload: these tests only load metadata.
+
+
+def open_metadata(path, *, integrated=False, platform="linux", fraction=0.1,
+                  host_info="MemAvailable: 28311552 kB\n", cuda_free=1031131130,
+                  buffer_size=None, device="cuda:0", group=None):
+    real_open = open
+
+    def open_file(name, *args, **kwargs):
+        if str(name) == "/proc/meminfo":
+            if isinstance(host_info, Exception):
+                raise host_info
+            return io.StringIO(host_info)
+        return real_open(name, *args, **kwargs)
+
+    with ExitStack() as stack:
+        stack.enter_context(mock.patch.object(sys, "platform", platform))
+        stack.enter_context(mock.patch.object(torch.cuda, "get_device_properties",
+            return_value=SimpleNamespace(is_integrated=integrated, managed_memory=True, unified_addressing=True)))
+        stack.enter_context(mock.patch.object(torch.cuda, "mem_get_info", return_value=(cuda_free, cuda_free)))
+        stack.enter_context(mock.patch("builtins.open", side_effect=open_file))
+        return safe_open(str(path), "pt", device, process_group=group, backend=Backend.MMAP,
+                         concurrency=1, chunk_size=1 << 20, io_depth=1,
+                         buffer_size=buffer_size, max_free_mem_usage=fraction, load_now=False)
+
+
+class MemoryBudgetTest(unittest.TestCase):
+    def setUp(self):
+        env = {key: value for key, value in os.environ.items() if not key.startswith("INSTANTTENSOR_")}
+        patch = mock.patch.dict(os.environ, env, clear=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / "weights.safetensors"
+        write_weights(self.path, 1 << 20)
+
+    def test_budget_source_selection(self):
+        size = 128 << 20
+        write_weights(self.path, size)
+        for platform, integrated, accepted in (("linux", True, True), ("linux", False, False), ("win32", True, False)):
+            with self.subTest(platform=platform, integrated=integrated):
+                options = dict(platform=platform, integrated=integrated, buffer_size=size,
+                               host_info="MemAvailable: 1048576 kB\n", cuda_free=64 << 20, fraction=1.0)
+                if accepted:
+                    self.assertEqual(open_metadata(self.path, **options).keys(), ["weight"])
+                else:
+                    with self.assertRaises((ValueError, RuntimeError)):
+                        open_metadata(self.path, **options)
+
+    def test_original_unified_memory_admission_regression(self):
+        size = 1342177280  # 1.25 GiB ring with ~0.96 GiB CUDA free, but 27 GiB MemAvailable.
+        write_weights(self.path, size)
+        self.assertEqual(open_metadata(self.path, integrated=True, buffer_size=size).keys(), ["weight"])
+
+    def test_integrated_gpu_supports_automatic_buffer(self):
+        self.assertEqual(open_metadata(self.path, integrated=True, cuda_free=0).keys(), ["weight"])
+
+    def test_swap_is_not_part_of_the_budget(self):
+        size = 128 << 20
+        write_weights(self.path, size)
+        with self.assertRaises((ValueError, RuntimeError)):
+            open_metadata(self.path, integrated=True, buffer_size=size, fraction=1.0,
+                          host_info="MemAvailable: 65536 kB\nSwapFree: 999999999 kB\n")
+
+    def test_fraction_controls_admission(self):
+        size = 128 << 20
+        write_weights(self.path, size)
+        options = dict(integrated=True, buffer_size=size, host_info="MemAvailable: 262144 kB\n")
+        self.assertEqual(open_metadata(self.path, fraction=0.75, **options).keys(), ["weight"])
+        with self.assertRaises((ValueError, RuntimeError)):
+            open_metadata(self.path, fraction=0.25, **options)
+
+    def test_invalid_fraction_is_rejected(self):
+        for fraction in (0, -0.1, 1.1, float("nan"), float("inf")):
+            with self.subTest(fraction=fraction), self.assertRaises((ValueError, RuntimeError)):
+                open_metadata(self.path, integrated=True, fraction=fraction)
+
+    def test_host_memory_read_errors_are_reported(self):
+        for info in ("MemTotal: 1048576 kB\n", "MemAvailable: invalid kB\n", OSError("meminfo unavailable")):
+            with self.subTest(info=info), self.assertRaises((OSError, ValueError, RuntimeError)):
+                open_metadata(self.path, integrated=True, host_info=info)
+
+
+class DistributedMemoryBudgetTest(unittest.TestCase):
+    @unittest.skipUnless(torch.cuda.device_count() >= 2, "two GPUs required")
+    def test_ranks_agree_on_admission_and_rejection(self):
+        root = Path(__file__).resolve().parents[1]
+        env = {key: value for key, value in os.environ.items() if not key.startswith("INSTANTTENSOR_")}
+        env["PYTHONPATH"] = str(root)
+        result = subprocess.run([
+            sys.executable, "-m", "torch.distributed.run", "--standalone", "--nproc-per-node=2",
+            str(Path(__file__).resolve()), "--distributed",
+        ], cwd=root, env=env, capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+def exercise_distributed():
+    import torch.distributed as dist
+
+    rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", timeout=timedelta(seconds=20))
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "weights.safetensors"
+            for scenario in ("mixed_accept", "mixed_reject", "invalid_fraction", "unreadable_host"):
+                size = (64 if scenario == "mixed_reject" else 16) << 20
+                write_weights(path, size)
+                options = dict(integrated=(rank == 0), cuda_free=64 << 20,
+                               host_info="MemAvailable: 262144 kB\n", fraction=0.5)
+                if rank == 0 and scenario == "invalid_fraction":
+                    options["fraction"] = 0.0
+                if rank == 0 and scenario == "unreadable_host":
+                    options["host_info"] = OSError("meminfo unavailable")
+                try:
+                    open_metadata(path, buffer_size=size, device=f"cuda:{rank}", group=dist.group.WORLD, **options)
+                    accepted = True
+                except (OSError, ValueError, RuntimeError):
+                    accepted = False
+                outcomes = [None, None]
+                dist.all_gather_object(outcomes, accepted)
+                assert outcomes == [scenario == "mixed_accept"] * 2, (scenario, outcomes)
+    finally:
+        dist.destroy_process_group()
+
+
 if __name__ == "__main__":
-    unittest.main()
+    if "--distributed" in sys.argv:
+        exercise_distributed()
+    else:
+        unittest.main()

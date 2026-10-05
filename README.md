@@ -243,19 +243,9 @@ argument takes precedence over its corresponding environment variable.
 | `INSTANTTENSOR_CHUNK_SIZE` | File I/O chunk size in bytes. | Automatically determined for the selected backend. |
 | `INSTANTTENSOR_CONCURRENCY` | Number of worker threads for `MMAP` and `CUFILE`; other backends ignore it. | Automatically determined for the selected backend. |
 | `INSTANTTENSOR_IO_DEPTH` | Maximum number of rank-local I/O operations in flight. Higher values can increase throughput and staging-memory usage; the maximum is 1024. | Automatically determined for the selected backend. |
-| `INSTANTTENSOR_MAX_FREE_MEM_USAGE` | Finite fraction of selected available memory for the logical device buffer; must satisfy `0 < value <= 1`. | `0.5` |
-| `INSTANTTENSOR_MEMORY_BUDGET_SOURCE` | `cuda_free`, or opt-in `mem_available` for a fixed buffer on Linux integrated NVIDIA GB10 (sm_121). | `cuda_free` |
+| `INSTANTTENSOR_MAX_FREE_MEM_USAGE` | Maximum fraction of currently free GPU memory available to the logical device buffer. | `0.5` |
 | `INSTANTTENSOR_CACHE_BUFFER` | Set to `1` to cache pinned host staging buffers across loader opens. Cached memory remains pinned until process cleanup. | `0` |
 | `INSTANTTENSOR_DEBUG` | Set to `1` to print backend selection, buffer sizes, timing, and throughput diagnostics. | `0` |
-
-On DGX Spark, CUDA free-memory reporting can exclude reclaimable system memory.
-For an explicitly bounded ring, `mem_available` uses Linux `MemAvailable` after
-validating `MemTotal`; it never credits swap. Unsupported hardware, automatic
-buffers, or invalid host metadata reject the request. Distributed loading still
-uses the minimum budget across ranks. Host availability is an admission estimate,
-not a native-allocation guarantee. Native allocation can still fail, and its
-error is propagated. The default CUDA budget and automatic-buffer path are
-unchanged. See [NVIDIA's UMA reporting guidance](https://docs.nvidia.com/dgx/dgx-spark/known-issues.html#guidance-for-reporting-memory-resources-with-unified-memory-architecture).
 
 The I/O capacity required by a configuration is
 `round_up(chunk_size, page_size) * io_depth * world_size`. When `buffer_size`
